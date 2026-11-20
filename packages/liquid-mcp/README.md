@@ -14,7 +14,10 @@ export OPENAI_API_KEY=sk-...         # or GEMINI_API_KEY / ANTHROPIC_API_KEY,
 ```
 
 Tools: `liquid_connect`, `liquid_fetch`, `liquid_query`, `liquid_discover`,
-`liquid_list_adapters`. Adapters and credentials persist under `~/.liquid`.
+`liquid_list_adapters`. With `LIQUID_ALLOW_WRITES=1` it also offers `liquid_execute`
+(database writes) and `liquid_request` (form, multipart file-upload and raw binary
+bodies — files only from `LIQUID_FILE_ROOTS`, capped by `LIQUID_MAX_BODY_BYTES`).
+Adapters and credentials persist under `~/.liquid`.
 
 This is a thin launcher over [`liquid-api[mcp]`](https://pypi.org/project/liquid-api/);
 all engine code lives there. Full docs: https://github.com/ertad-family/liquid

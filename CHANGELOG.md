@@ -4,6 +4,34 @@ All notable changes to Liquid will be documented in this file.
 
 ## [Unreleased]
 
+## [0.68.0] - 2026-11-20
+
+### Added — form, multipart and raw-binary request bodies (file uploads)
+The write path was JSON-only. It now also sends `application/x-www-form-urlencoded`,
+`multipart/form-data` (plain fields + file parts from a path, raw bytes or base64, each with
+filename and content type) and raw binary bodies (`audio/*`, `application/octet-stream` — the file
+is the body). See [docs/REQUEST_BODIES.md](docs/REQUEST_BODIES.md).
+
+- **Client API.** `Liquid.execute` / `execute_action` take `encoding`, `files`, `binary` and `query`;
+  new `Liquid.execute_endpoint` writes straight to a discovered endpoint without a pre-built action
+  (gated by `allow_write=True`, like `Liquid.write`). Plain-JSON calls are byte-for-byte unchanged.
+- **MCP.** New `liquid_request` tool (listed only with `LIQUID_ALLOW_WRITES=1`): form / multipart /
+  binary / JSON to an HTTP endpoint. `liquid_connect` and `liquid_list_adapters` now return
+  `write_endpoints` with the body types each one declares.
+- **Discovery.** `Endpoint.request_content_types` carries every request media type an OpenAPI spec
+  declares (`requestBody.content`; Swagger 2 `consumes` and `in: formData`), and
+  `request_schema` now falls back to the form / multipart / binary schema when JSON isn't offered.
+  `Endpoint.preferred_body_encoding()` tells the caller which encoding the endpoint expects; the
+  executor uses it when no `encoding` is given. Swagger 2 `formData` parameters are no longer
+  mis-filed as query parameters.
+- **Safety.** One size cap for the whole body (25 MiB default — `Liquid(max_body_bytes=…)`,
+  `LIQUID_MAX_BODY_BYTES`); file `path` parts confined to allowed roots (`Liquid(file_roots=…)`;
+  always on in the MCP server — `LIQUID_FILE_ROOTS`, default `~/.liquid/uploads`; symlinks and `..`
+  resolved); file contents never logged or echoed in errors. Oversized or disallowed bodies return
+  a failed result and send nothing. New exceptions `RequestBodyError`, `BodyTooLargeError`,
+  `FileAccessError`.
+- `adapter_to_tools` appends the expected body type to write-tool descriptions for non-JSON endpoints.
+
 ### Added — HTML-grid adapter (any list/detail website as an interface)
 A website with catalog data — a news feed, a product catalogue, a job board, a
 search-results table — now maps onto the same `fetch`/`query` surface as a JSON

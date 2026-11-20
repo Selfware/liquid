@@ -28,6 +28,7 @@ from liquid.auth.schemes import (
     HMACAuth,
     OAuth2Auth,
 )
+from liquid.body import DEFAULT_MAX_BODY_BYTES, BodyEncoding, BodyLimits, FilePart, RequestBody
 from liquid.cache import InMemoryCache
 from liquid.catalog import HttpCatalogRegistry
 from liquid.client import Liquid
@@ -39,13 +40,16 @@ from liquid.exceptions import (
     ActionNotVerifiedError,
     AuthError,
     AuthSetupError,
+    BodyTooLargeError,
     DiscoveryError,
     EndpointGoneError,
     FieldNotFoundError,
+    FileAccessError,
     LiquidError,
     MappingError,
     RateLimitError,
     Recovery,
+    RequestBodyError,
     ServiceDownError,
     SyncRuntimeError,
     ToolCall,
@@ -147,6 +151,7 @@ from liquid.webhooks import (
 
 __all__ = [
     "CANONICAL_INTENTS",
+    "DEFAULT_MAX_BODY_BYTES",
     "APISchema",
     "ActionConfig",
     "ActionError",
@@ -168,6 +173,9 @@ __all__ = [
     "BatchErrorPolicy",
     "BatchResult",
     "BearerAuth",
+    "BodyEncoding",
+    "BodyLimits",
+    "BodyTooLargeError",
     "BundledAdapterRegistry",
     "CacheStore",
     "CallableBackend",
@@ -192,8 +200,10 @@ __all__ = [
     "FetchUntilResult",
     "FieldMapping",
     "FieldNotFoundError",
+    "FileAccessError",
     "FileAdapterRegistry",
     "FileAttachment",
+    "FilePart",
     "FileVault",
     "GeminiBackend",
     "GenericHMACWebhookVerifier",
@@ -231,6 +241,8 @@ __all__ = [
     "RateLimitError",
     "RateLimiter",
     "Recovery",
+    "RequestBody",
+    "RequestBodyError",
     "ResponseValidator",
     "SSEEvent",
     "SchemaMismatchSignal",

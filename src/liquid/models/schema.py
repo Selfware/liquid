@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
+
+from liquid.body import preferred_encoding
+
+if TYPE_CHECKING:
+    from liquid.body import BodyEncoding
 
 
 class PaginationType(StrEnum):
@@ -65,6 +70,12 @@ class Endpoint(BaseModel):
     kind: EndpointKind = EndpointKind.READ
     parameters: list[Parameter] = Field(default_factory=list)
     request_schema: dict[str, Any] | None = None
+    request_content_types: list[str] = Field(default_factory=list)
+    """Media types the endpoint accepts as a request body, as declared by the spec
+    (OpenAPI ``requestBody.content`` keys / Swagger ``consumes``), in declared order —
+    e.g. ``["multipart/form-data"]`` or ``["audio/wav", "application/octet-stream"]``.
+    Empty when the spec says nothing (treated as JSON). Tells a caller which body
+    encoding the endpoint expects; see :meth:`preferred_body_encoding`."""
     response_schema: dict[str, Any] = Field(default_factory=dict)
     pagination: PaginationType | None = None
     idempotency_header: str | None = None
@@ -77,6 +88,10 @@ class Endpoint(BaseModel):
     """Protocol-specific data the transport driver needs that doesn't fit the
     generic fields — e.g. a GraphQL operation/selection-set, a SOAP action and
     namespace, a gRPC service/method. Empty for plain REST."""
+
+    def preferred_body_encoding(self) -> BodyEncoding | None:
+        """The body encoding this endpoint expects (JSON wins when offered), or ``None`` if undeclared."""
+        return preferred_encoding(self.request_content_types)
 
     def __repr__(self) -> str:
         return f"Endpoint({self.method} {self.path}, protocol={self.protocol!r}, kind={self.kind.value})"

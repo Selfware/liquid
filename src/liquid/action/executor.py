@@ -13,7 +13,8 @@ import httpx  # noqa: TC002
 from liquid.action.builder import RequestBodyBuilder
 from liquid.action.path import PathResolver
 from liquid.action.validator import RequestValidator
-from liquid.exceptions import RateLimitError, Recovery, ServiceDownError, ToolCall
+from liquid.body import BodyEncoding, BodyLimits, RequestBody, encode_body, encoding_for_content_type
+from liquid.exceptions import RateLimitError, Recovery, RequestBodyError, ServiceDownError, ToolCall
 from liquid.models.action import ActionConfig, ActionError, ActionErrorType, ActionResult
 from liquid.sync.retry import WRITE_RETRY_DEFAULTS, RetryPolicy, with_retry
 
@@ -35,6 +36,29 @@ _STATUS_TO_ERROR: dict[int, ActionErrorType] = {
 
 _GRAPHQL_MUTATION_RE = re.compile(r"^/graphql#mutation\.(.+)$")
 _MCP_TOOL_RE = re.compile(r"^/mcp/tools/(.+)$")
+
+
+def _body_error_result(
+    action: ActionConfig,
+    message: str,
+    hint: str,
+    details: dict[str, Any] | None = None,
+) -> ActionResult:
+    """A refused request body (too large, bad file, bad option) — nothing was sent."""
+    return ActionResult(
+        action_id=action.action_id,
+        endpoint_path=action.endpoint_path,
+        method=action.endpoint_method,
+        status_code=0,
+        success=False,
+        error=ActionError(
+            type=ActionErrorType.VALIDATION_ERROR,
+            message=message,
+            details=details or None,
+            recovery_hint=hint or None,
+            recovery=Recovery(hint=hint, retry_safe=False) if hint else None,
+        ),
+    )
 
 
 def _action_error_for_exception(exc: RateLimitError | ServiceDownError) -> ActionError:
@@ -150,7 +174,9 @@ class ActionExecutor:
         rate_limiter: RateLimiter | None = None,
         respect_rate_limit: bool = True,
         adapter_id: str | None = None,
+        body_limits: BodyLimits | None = None,
     ) -> None:
+        self.body_limits = body_limits or BodyLimits()
         self.http_client = http_client
         self.vault = vault
         self.retry_policy = retry_policy or WRITE_RETRY_DEFAULTS
@@ -168,6 +194,7 @@ class ActionExecutor:
         schema: APISchema,
         auth_ref: str,
         idempotency_key: str | None = None,
+        body: RequestBody | None = None,
     ) -> ActionResult:
         """Execute a single write action.
 
@@ -175,6 +202,10 @@ class ActionExecutor:
         1. Find endpoint in schema
         2. Validate data against request_schema
         3. Detect protocol (REST / GraphQL / MCP) and dispatch
+
+        ``body`` selects a non-JSON encoding (form / multipart / raw binary) and carries
+        file parts and URL query parameters; omitted, the body is JSON as before. Only
+        plain REST endpoints support non-JSON bodies.
         """
         endpoint = next(
             (ep for ep in schema.endpoints if ep.path == action.endpoint_path and ep.method == action.endpoint_method),
@@ -200,9 +231,31 @@ class ActionExecutor:
                 ),
             )
 
-        if endpoint.request_schema:
+        body_spec = body or RequestBody()
+        is_rest = not (_GRAPHQL_MUTATION_RE.match(action.endpoint_path) or _MCP_TOOL_RE.match(action.endpoint_path))
+        encoding = body_spec.resolve_encoding(endpoint.preferred_body_encoding() if is_rest else None)
+        if not is_rest and (encoding != BodyEncoding.JSON or body_spec.query):
+            return _body_error_result(
+                action,
+                "Form, multipart, binary bodies and query parameters are only supported for plain REST endpoints",
+                "Use a REST endpoint for uploads, or send JSON fields only",
+            )
+        declared = {encoding_for_content_type(ct) for ct in endpoint.request_content_types}
+        if declared and encoding not in declared:
+            logger.warning(
+                "%s %s declares %s but the call uses %s encoding",
+                action.endpoint_method,
+                action.endpoint_path,
+                endpoint.request_content_types,
+                encoding.value,
+            )
+
+        if endpoint.request_schema and encoding != BodyEncoding.BINARY:
             validator = RequestValidator()
-            errors = validator.validate(data, endpoint.request_schema)
+            # A multipart file part satisfies a schema property of the same name (declared as
+            # ``type: string, format: binary``); the bytes themselves are never put in `data`.
+            checked = {**data, **{f.field: "<file>" for f in body_spec.files}}
+            errors = validator.validate(checked, endpoint.request_schema)
             if errors:
                 return ActionResult(
                     action_id=action.action_id,
@@ -229,7 +282,9 @@ class ActionExecutor:
         if _MCP_TOOL_RE.match(action.endpoint_path):
             return await self._execute_mcp(action, data, schema, endpoint)
 
-        return await self._execute_rest(action, data, schema, auth_ref, endpoint, idempotency_key)
+        return await self._execute_rest(
+            action, data, schema, auth_ref, endpoint, idempotency_key, body=body_spec, encoding=encoding
+        )
 
     async def _execute_rest(
         self,
@@ -239,16 +294,35 @@ class ActionExecutor:
         auth_ref: str,
         endpoint: Endpoint,
         idempotency_key: str | None = None,
+        *,
+        body: RequestBody | None = None,
+        encoding: BodyEncoding = BodyEncoding.JSON,
     ) -> ActionResult:
         """Execute a standard REST HTTP write action."""
         builder = RequestBodyBuilder(action.mappings, action.static_values)
-        body = builder.build(data)
+        fields = builder.build(data)
+        body_spec = body or RequestBody()
+        try:
+            encoded = await encode_body(encoding, fields, body_spec, self.body_limits)
+        except RequestBodyError as exc:
+            return _body_error_result(action, exc.message, exc.recovery_hint or "", details=exc.details)
+        if encoded.encoding != BodyEncoding.JSON:
+            # Sizes and counts only — never the body.
+            logger.info(
+                "Sending %s body to %s %s: %d bytes, %d file part(s)",
+                encoded.encoding.value,
+                action.endpoint_method,
+                action.endpoint_path,
+                encoded.size,
+                encoded.file_count,
+            )
 
         path_resolver = PathResolver()
         resolved_path = path_resolver.resolve(action.endpoint_path, data, endpoint.parameters)
 
         auth_value = await self.vault.get(auth_ref)
         headers: dict[str, str] = {"Authorization": f"Bearer {auth_value}"}
+        headers.update(encoded.headers)
 
         idem_key = idempotency_key
         if endpoint.idempotency_header:
@@ -259,14 +333,22 @@ class ActionExecutor:
 
         rate_key = self._rate_key(action.endpoint_path)
 
+        # JSON keeps the exact historical call shape; other encodings send the pre-built
+        # bytes (so a retry re-sends the identical body) and may add URL query params.
+        send_kwargs: dict[str, Any] = {"json": fields} if encoded.encoding == BodyEncoding.JSON else {}
+        if encoded.content is not None:
+            send_kwargs["content"] = encoded.content
+        if body_spec.query:
+            send_kwargs["params"] = body_spec.query
+
         async def _send() -> httpx.Response:
             if self.rate_limiter is not None and self.respect_rate_limit:
                 await self.rate_limiter.acquire(rate_key)
             resp = await self.http_client.request(
                 method=action.endpoint_method,
                 url=url,
-                json=body,
                 headers=headers,
+                **send_kwargs,
             )
             if self.rate_limiter is not None:
                 await self.rate_limiter.observe_response(rate_key, resp)

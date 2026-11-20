@@ -110,6 +110,7 @@ class OpenAPIDiscovery:
                 params = self._extract_parameters(path_item.get("parameters", []) + operation.get("parameters", []))
                 response_schema = _resolve_refs(self._extract_response_schema(operation, is_v3), spec)
                 request_schema = _resolve_refs(self._extract_request_schema(operation, is_v3), spec)
+                request_content_types = self._extract_request_content_types(operation, is_v3, spec)
                 description = operation.get("summary", operation.get("description", ""))
                 pagination = self._infer_pagination(params, operation)
                 kind = self._method_to_kind(method)
@@ -123,6 +124,7 @@ class OpenAPIDiscovery:
                         kind=kind,
                         parameters=params,
                         request_schema=request_schema,
+                        request_content_types=request_content_types,
                         response_schema=response_schema,
                         pagination=pagination,
                         idempotency_header=idempotency_header,
@@ -141,6 +143,8 @@ class OpenAPIDiscovery:
                 continue
 
             location_str = p.get("in", "query")
+            if location_str == "formData":
+                continue  # Swagger 2 form fields belong to the request body, not the URL
             try:
                 location = ParameterLocation(location_str)
             except ValueError:
@@ -178,13 +182,48 @@ class OpenAPIDiscovery:
             if not request_body or not isinstance(request_body, dict):
                 return None
             content = request_body.get("content", {})
-            json_content = content.get("application/json", {})
-            return json_content.get("schema") or None
+            if not isinstance(content, dict):
+                return None
+            # JSON first (the historical default); otherwise the first declared
+            # non-JSON type that carries a schema (form / multipart / raw upload).
+            ordered = sorted(content, key=lambda ct: 0 if _is_json_type(ct) else 1)
+            for content_type in ordered:
+                entry = content.get(content_type)
+                schema = entry.get("schema") if isinstance(entry, dict) else None
+                if schema:
+                    return schema
+            return None
         else:
             for param in operation.get("parameters", []):
                 if isinstance(param, dict) and param.get("in") == "body":
                     return param.get("schema")
-            return None
+            return _form_data_schema(operation.get("parameters", []))
+
+    def _extract_request_content_types(self, operation: dict[str, Any], is_v3: bool, spec: dict[str, Any]) -> list[str]:
+        """The request media types the operation declares, in declared order.
+
+        OpenAPI 3: the keys of ``requestBody.content``. Swagger 2: ``consumes``
+        (operation, else spec-level) when the operation takes a body or form params;
+        a form-data operation with no ``consumes`` is inferred (multipart if it
+        uploads a ``file``, else urlencoded). Empty when the operation has no body.
+        """
+        if is_v3:
+            request_body = operation.get("requestBody")
+            content = request_body.get("content") if isinstance(request_body, dict) else None
+            return [str(ct) for ct in content] if isinstance(content, dict) else []
+
+        params = [p for p in operation.get("parameters", []) if isinstance(p, dict)]
+        has_body = any(p.get("in") == "body" for p in params)
+        form_params = [p for p in params if p.get("in") == "formData"]
+        if not has_body and not form_params:
+            return []
+        consumes = operation.get("consumes", spec.get("consumes"))
+        if isinstance(consumes, list) and consumes:
+            return [str(ct) for ct in consumes]
+        if has_body:
+            return ["application/json"]
+        has_file = any(p.get("type") == "file" for p in form_params)
+        return ["multipart/form-data" if has_file else "application/x-www-form-urlencoded"]
 
     @staticmethod
     def _detect_idempotency(operation: dict[str, Any]) -> str | None:
@@ -260,6 +299,34 @@ class OpenAPIDiscovery:
         if "page" in param_names or "page_number" in param_names:
             return PaginationType.PAGE_NUMBER
         return None
+
+
+def _is_json_type(content_type: str) -> bool:
+    ct = content_type.split(";", 1)[0].strip().lower()
+    return ct in ("application/json", "text/json") or ct.endswith("+json")
+
+
+def _form_data_schema(raw_params: list[Any]) -> dict[str, Any] | None:
+    """Build an object schema from Swagger 2 ``in: formData`` parameters (``type: file`` → binary)."""
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for p in raw_params:
+        if not isinstance(p, dict) or p.get("in") != "formData" or not p.get("name"):
+            continue
+        prop: dict[str, Any] = {"type": "string", "format": "binary"} if p.get("type") == "file" else {}
+        if not prop:
+            prop = {k: p[k] for k in ("type", "format", "enum", "items") if k in p}
+        if p.get("description"):
+            prop["description"] = p["description"]
+        properties[p["name"]] = prop
+        if p.get("required"):
+            required.append(p["name"])
+    if not properties:
+        return None
+    schema: dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
 
 
 def _pagination_from_extension(ext: Any) -> PaginationType | None:

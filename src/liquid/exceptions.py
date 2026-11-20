@@ -188,3 +188,18 @@ class VaultError(LiquidError):
 
 class ActionNotVerifiedError(LiquidError):
     pass
+
+
+class RequestBodyError(LiquidError):
+    """A write request body could not be built (bad file, bad base64, inconsistent options).
+
+    Messages never contain file contents.
+    """
+
+
+class BodyTooLargeError(RequestBodyError):
+    """The encoded request body exceeds the configured size cap."""
+
+
+class FileAccessError(RequestBodyError):
+    """A file part could not be read — missing, unreadable, or outside the allowed roots."""

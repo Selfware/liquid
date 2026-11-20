@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 
 from liquid.client import Liquid
 from liquid.llm import llm_from_env
@@ -43,11 +44,60 @@ def _writes_enabled() -> bool:
     return os.environ.get("LIQUID_ALLOW_WRITES", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _file_roots() -> list[Path]:
+    """Directories an agent may read upload files from (``path`` parts of ``liquid_request``).
+
+    ``LIQUID_FILE_ROOTS`` — ``os.pathsep``-separated — overrides the default
+    ``$LIQUID_HOME/uploads`` (``~/.liquid/uploads``). A path outside every root is refused
+    (symlinks are resolved first); an agent can always send ``content_base64`` instead.
+    """
+    raw = os.environ.get("LIQUID_FILE_ROOTS", "")
+    roots = [Path(p) for p in raw.split(os.pathsep) if p.strip()]
+    if roots:
+        return roots
+    from liquid.persistence import _liquid_home
+
+    return [_liquid_home() / "uploads"]
+
+
+def _max_body_bytes() -> int | None:
+    """Upload size cap from ``LIQUID_MAX_BODY_BYTES`` (bytes); ``None`` → the 25 MiB default."""
+    raw = os.environ.get("LIQUID_MAX_BODY_BYTES", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        logger.warning("Ignoring invalid LIQUID_MAX_BODY_BYTES (expected a positive integer)")
+        return None
+    return value
+
+
+def _write_endpoints(schema) -> list[dict]:
+    """Write endpoints with the request body encodings they declare (what ``liquid_request`` can send)."""
+    from liquid.models.schema import EndpointKind
+
+    return [
+        {"method": e.method, "path": e.path, "request_content_types": e.request_content_types}
+        for e in schema.endpoints
+        if e.kind != EndpointKind.READ
+    ]
+
+
 def _build_liquid() -> tuple[Liquid, FileAdapterRegistry]:
     from liquid._defaults import CollectorSink
 
     registry = FileAdapterRegistry()
-    liquid = Liquid(llm=llm_from_env(), vault=FileVault(), sink=CollectorSink(), registry=registry)
+    liquid = Liquid(
+        llm=llm_from_env(),
+        vault=FileVault(),
+        sink=CollectorSink(),
+        registry=registry,
+        max_body_bytes=_max_body_bytes(),
+        file_roots=_file_roots(),  # an agent may only upload files from here
+    )
     return liquid, registry
 
 
@@ -105,6 +155,47 @@ def _tool_definitions(allow_writes: bool = False) -> list:
         # so both success and error results validate against the declared output schema.
         return {"type": "object", "properties": {**props, "error": {"type": "string"}}, "additionalProperties": True}
 
+    _write_endpoints_schema = {
+        "type": "array",
+        "description": (
+            "Endpoints that change data: method, path and request_content_types (the body encodings the API "
+            "declares, e.g. multipart/form-data, audio/wav) — use with liquid_request."
+        ),
+        "items": {"type": "object", "additionalProperties": True},
+    }
+    file_part = {
+        "type": "object",
+        "description": (
+            "One file. Give exactly one of `path` (under the server's allowed upload roots) or `content_base64`."
+        ),
+        "properties": {
+            "field": {
+                "type": "string",
+                "description": 'Multipart form field name for this file (default "file"); ignored for `binary`.',
+            },
+            "path": {
+                "type": "string",
+                "description": (
+                    "Local file path. Must resolve under an allowed upload root (LIQUID_FILE_ROOTS, default "
+                    "~/.liquid/uploads); a relative path is taken relative to the first root."
+                ),
+            },
+            "content_base64": {
+                "type": "string",
+                "description": "The file's bytes as standard base64 (no data: prefix). Counts toward the size cap.",
+            },
+            "filename": {
+                "type": "string",
+                "description": "Filename to send; defaults to the path's base name.",
+            },
+            "content_type": {
+                "type": "string",
+                "description": 'MIME type, e.g. "audio/wav" or "image/png"; guessed from the filename when omitted.',
+            },
+        },
+        "additionalProperties": False,
+    }
+
     tools = [
         Tool(
             name="liquid_connect",
@@ -149,6 +240,7 @@ def _tool_definitions(allow_writes: bool = False) -> list:
                     "service": {"type": "string"},
                     "mapped_fields": {"type": "array", "items": {"type": "string"}},
                     "endpoints": {"type": "array", "items": {"type": "string"}},
+                    "write_endpoints": _write_endpoints_schema,
                 }
             ),
         ),
@@ -157,8 +249,9 @@ def _tool_definitions(allow_writes: bool = False) -> list:
             title="List connected adapters",
             description=(
                 "List the adapters already connected on this machine (read from ~/.liquid) — read-only, no "
-                "network call, no LLM. Each entry has its adapter_id, service name, source url and endpoint "
-                "paths. Call this to find an adapter_id for liquid_fetch / liquid_query / liquid_estimate, or "
+                "network call, no LLM. Each entry has its adapter_id, service name, source url, endpoint "
+                "paths, and its write endpoints with the request body types they accept. Call this to find an "
+                "adapter_id for liquid_fetch / liquid_query / liquid_estimate, or "
                 "to check whether an API is already connected before calling liquid_connect."
             ),
             annotations=ToolAnnotations(
@@ -173,7 +266,7 @@ def _tool_definitions(allow_writes: bool = False) -> list:
                 {
                     "adapters": {
                         "type": "array",
-                        "description": "Connected adapters with adapter_id, service, url, endpoints.",
+                        "description": "Connected adapters with adapter_id, service, url, endpoints, write_endpoints.",
                         "items": {"type": "object", "additionalProperties": True},
                     }
                 }
@@ -461,6 +554,105 @@ def _tool_definitions(allow_writes: bool = False) -> list:
                 ),
             )
         )
+
+        tools.append(
+            Tool(
+                name="liquid_request",
+                title="Send a form, file upload or raw binary body to an HTTP API",
+                description=(
+                    "Write to a connected HTTP API endpoint with a body that is not plain JSON: a form "
+                    "(application/x-www-form-urlencoded), a multipart/form-data file upload (plain `fields` plus "
+                    "`files`), or a raw binary body such as audio/* or application/octet-stream (`binary`). Also "
+                    "sends ordinary JSON when no files are given. Use it for CMS media uploads, voice/audio "
+                    "transcription endpoints, Twilio-style form posts. Files come from a `path` (only under the "
+                    "server's allowed upload roots) or inline `content_base64`; the whole body is capped (25 MiB by "
+                    "default) and nothing is sent if it is too large. File contents are never logged. The "
+                    "`encoding` defaults from the files given, else from the endpoint's declared content type "
+                    "(see `write_endpoints[].request_content_types` from liquid_connect / liquid_list_adapters). "
+                    "This tool is only available because the server was started with LIQUID_ALLOW_WRITES=1. "
+                    "For database inserts/updates use liquid_execute; to read data use liquid_fetch. "
+                    "Returns {success, status_code, response_body} or an `error` with `error_detail.recovery_hint`."
+                ),
+                annotations=ToolAnnotations(
+                    title="Send a form, file upload or raw binary body to an HTTP API",
+                    readOnlyHint=False,
+                    destructiveHint=True,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "adapter_id": adapter_id,
+                        "endpoint": {
+                            "type": "string",
+                            "description": (
+                                'The endpoint path to write to, exactly as listed by liquid_connect (e.g. "/media" '
+                                'or "/v1/listen"). Path placeholders like {id} are filled from `fields`.'
+                            ),
+                        },
+                        "method": {
+                            "type": "string",
+                            "enum": ["POST", "PUT", "PATCH", "DELETE"],
+                            "description": "HTTP method; only needed when the path has several write methods.",
+                        },
+                        "fields": {
+                            "type": "object",
+                            "description": (
+                                "Plain fields: the form fields for form/multipart, or the JSON body otherwise. "
+                                "Nested objects become a[b]=…; a list of scalars repeats the key."
+                            ),
+                            "additionalProperties": True,
+                        },
+                        "encoding": {
+                            "type": "string",
+                            "enum": ["json", "form", "multipart", "binary"],
+                            "description": (
+                                "Body encoding. Omit to infer: `binary` if given, multipart if `files` given, "
+                                "else the endpoint's declared content type, else json."
+                            ),
+                        },
+                        "files": {
+                            "type": "array",
+                            "description": "File parts for a multipart/form-data upload (use with encoding=multipart).",
+                            "items": file_part,
+                        },
+                        "binary": {
+                            **file_part,
+                            "description": (
+                                "A single file sent as the entire raw request body (encoding=binary), e.g. an audio "
+                                "file for a transcription endpoint. Its content_type becomes the Content-Type; its "
+                                "filename, if given, is sent as Content-Disposition (WordPress media upload)."
+                            ),
+                        },
+                        "query": {
+                            "type": "object",
+                            "description": 'URL query parameters, e.g. {"model": "nova-2", "language": "en"}.',
+                            "additionalProperties": True,
+                        },
+                    },
+                    "required": ["adapter_id", "endpoint"],
+                },
+                outputSchema=_out(
+                    {
+                        "success": {"type": "boolean"},
+                        "status_code": {"type": "number"},
+                        "endpoint": {"type": "string"},
+                        "method": {"type": "string"},
+                        "response_body": {
+                            "type": "object",
+                            "description": "The API's JSON response, when it returned one.",
+                            "additionalProperties": True,
+                        },
+                        "error_detail": {
+                            "type": "object",
+                            "description": "On failure: type, recovery_hint and details (never file contents).",
+                            "additionalProperties": True,
+                        },
+                    }
+                ),
+            )
+        )
     return tools
 
 
@@ -518,6 +710,7 @@ def create_server():
                             "service": result.schema_.service_name,
                             "mapped_fields": [m.target_field for m in result.mappings],
                             "endpoints": [e.path for e in result.schema_.endpoints],
+                            "write_endpoints": _write_endpoints(result.schema_),
                         }
                     )
                 return _ok({"status": "review_needed", "detail": str(result)})
@@ -531,6 +724,7 @@ def create_server():
                                 "service": a.schema_.service_name,
                                 "url": a.schema_.source_url,
                                 "endpoints": [e.path for e in a.schema_.endpoints],
+                                "write_endpoints": _write_endpoints(a.schema_),
                             }
                             for a in await registry.list_all()
                         ]
@@ -615,6 +809,40 @@ def create_server():
                     allow_write=True,  # the server-level gate already authorized writes
                 )
                 return _ok(result)
+
+            if name == "liquid_request":
+                if not allow_writes:
+                    return _ok({"error": "writes are disabled; start the server with LIQUID_ALLOW_WRITES=1 to enable"})
+                config = await _find(arguments["adapter_id"])
+                if config is None:
+                    return _ok({"error": f"adapter {arguments['adapter_id']} not found"})
+                result = await liquid.execute_endpoint(
+                    config,
+                    arguments["endpoint"],
+                    arguments.get("fields") or {},
+                    method=arguments.get("method"),
+                    allow_write=True,  # the server-level gate already authorized writes
+                    encoding=arguments.get("encoding"),
+                    files=arguments.get("files"),
+                    binary=arguments.get("binary"),
+                    query=arguments.get("query"),
+                )
+                out: dict = {
+                    "success": result.success,
+                    "status_code": result.status_code,
+                    "endpoint": result.endpoint_path,
+                    "method": result.method,
+                }
+                if result.response_body is not None:
+                    out["response_body"] = result.response_body
+                if result.error is not None:
+                    out["error"] = result.error.message
+                    out["error_detail"] = {
+                        "type": result.error.type.value,
+                        "recovery_hint": result.error.recovery_hint,
+                        "details": result.error.details,
+                    }
+                return _ok(out)
 
             if name == "liquid_discover":
                 schema = await liquid.discover(arguments["url"], credentials=arguments.get("credentials"))

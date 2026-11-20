@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from liquid.auth.classifier import AuthClassifier, EscalationInfo
 from liquid.auth.manager import AuthManager
+from liquid.body import BodyEncoding, BodyLimits, FilePart, RequestBody
 from liquid.discovery.a2a import A2ADiscovery
 from liquid.discovery.adb import ADBDiscovery
 from liquid.discovery.bacnet import BACnetDiscovery
@@ -41,7 +43,7 @@ from liquid.exceptions import ActionNotVerifiedError, LiquidError, Recovery
 from liquid.mapping.learning import MappingLearner
 from liquid.mapping.proposer import MappingProposer
 from liquid.mapping.reviewer import MappingReview
-from liquid.models.action import ActionConfig, ActionResult
+from liquid.models.action import ActionConfig, ActionMapping, ActionResult
 from liquid.models.adapter import AdapterConfig, FieldMapping, SyncConfig
 from liquid.models.schema import APISchema, EndpointKind, SchemaDiff
 from liquid.sync.engine import SyncEngine
@@ -49,7 +51,8 @@ from liquid.sync.fetcher import Fetcher
 from liquid.sync.mapper import RecordMapper
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    import os
+    from collections.abc import Callable, Sequence
     from datetime import datetime
 
     from liquid.action.batch import BatchResult
@@ -193,7 +196,13 @@ class Liquid:
         event_store: Any | None = None,
         catalog: AdapterRegistry | None = None,
         use_bundled_adapters: bool = True,
+        max_body_bytes: int | None = None,
+        file_roots: Sequence[str | os.PathLike[str]] | None = None,
     ) -> None:
+        # Caps for non-JSON write bodies (uploads): total size (default 25 MiB) and, when
+        # ``file_roots`` is given, the only directories a file *path* may be read from.
+        # ``None`` roots = unrestricted (trusted in-process caller); the MCP server always sets roots.
+        self._body_limits = BodyLimits.build(max_bytes=max_body_bytes, allowed_roots=file_roots)
         self.llm = llm
         self.vault = vault
         self.sink = sink
@@ -1865,6 +1874,10 @@ class Liquid:
         max_tokens: int | None = None,
         include_meta: bool | None = None,
         verbosity: VerbosityLevel = "normal",
+        encoding: BodyEncoding | str | None = None,
+        files: Sequence[FilePart | dict[str, Any]] | None = None,
+        binary: FilePart | dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
     ) -> ActionResult:
         """Execute a write action by action_id.
 
@@ -1882,6 +1895,21 @@ class Liquid:
         - verbosity: shape ``response_body`` for the caller's context
           budget — ``"terse"``, ``"normal"`` (default), ``"full"``, or
           ``"debug"``. Matches the semantics of :meth:`fetch`.
+
+        Request-body encoding (JSON unless asked otherwise; ``data`` always carries the
+        plain fields):
+        - encoding: ``"json"`` | ``"form"`` | ``"multipart"`` | ``"binary"``. Omitted, it is
+          implied by ``files`` / ``binary``, else by the endpoint's declared content type
+          (``Endpoint.request_content_types``), else JSON.
+        - files: multipart file parts — each ``{"field", "path" | "content" | "content_base64",
+          "filename", "content_type"}`` (or a :class:`~liquid.body.FilePart`).
+        - binary: a raw body — one file part sent as the whole request body (``audio/*``,
+          ``application/octet-stream`` …); its ``content_type`` becomes the Content-Type.
+        - query: URL query parameters (e.g. ``{"model": "nova-2"}`` for a raw upload).
+
+        Bodies are capped (``Liquid(max_body_bytes=...)``, default 25 MiB) and file paths are
+        confined to ``Liquid(file_roots=...)`` when set; an oversized or disallowed body
+        returns a failed result without sending anything. File contents are never logged.
         """
         action = next((a for a in config.actions if a.action_id == action_id), None)
         if action is None:
@@ -1893,6 +1921,106 @@ class Liquid:
                 f"Action {action_id} has not been verified. Call create_adapter() with verified actions to approve."
             )
 
+        return await self._run_action(
+            config,
+            action,
+            data,
+            idempotency_key,
+            max_tokens=max_tokens,
+            include_meta=include_meta,
+            body=_build_request_body(encoding, files, binary, query),
+        )
+
+    async def execute_endpoint(
+        self,
+        config: AdapterConfig,
+        endpoint: str,
+        data: dict[str, Any] | None = None,
+        *,
+        method: str | None = None,
+        allow_write: bool = False,
+        idempotency_key: str | None = None,
+        max_tokens: int | None = None,
+        include_meta: bool | None = None,
+        encoding: BodyEncoding | str | None = None,
+        files: Sequence[FilePart | dict[str, Any]] | None = None,
+        binary: FilePart | dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> ActionResult:
+        """Send a write request straight to a discovered endpoint — no pre-built action needed.
+
+        Like :meth:`execute` (same body encodings, caps and result), but addressed by
+        endpoint path (+ optional ``method``) instead of an ``action_id``. If the adapter has
+        a verified action for the endpoint its field mappings are used; otherwise every key
+        of ``data`` is sent as a body field with the same name (path ``{placeholders}`` are
+        filled from ``data`` and not repeated in the body).
+
+        Off by default, like :meth:`write`: pass ``allow_write=True`` to permit the mutation.
+        """
+        if not allow_write:
+            raise LiquidError(
+                "Writes are disabled by default. Pass allow_write=True to permit this request.",
+                recovery=Recovery(
+                    hint="This will modify data in the target service — set allow_write=True to proceed.",
+                    retry_safe=False,
+                ),
+            )
+        candidates = [
+            ep
+            for ep in config.schema_.endpoints
+            if ep.path == endpoint and (method is None or ep.method == method.upper())
+        ]
+        writable = [ep for ep in candidates if ep.method.upper() not in ("GET", "HEAD", "OPTIONS")]
+        if not writable:
+            label = f"{method.upper()} " if method else ""
+            msg = f"No write endpoint {label}{endpoint} in adapter schema"
+            raise ValueError(msg)
+        if len(writable) > 1:
+            methods = sorted(ep.method for ep in writable)
+            msg = f"Endpoint {endpoint} has several write methods {methods}; pass method="
+            raise ValueError(msg)
+        target = writable[0]
+
+        data = data or {}
+        action = next(
+            (
+                a
+                for a in config.actions
+                if a.endpoint_path == target.path and a.endpoint_method == target.method and a.verified_by
+            ),
+            None,
+        )
+        if action is None:
+            path_params = set(re.findall(r"\{(\w+)\}", target.path))
+            action = ActionConfig(
+                endpoint_path=target.path,
+                endpoint_method=target.method,
+                mappings=[
+                    ActionMapping(source_field=k, target_path=k, confidence=1.0) for k in data if k not in path_params
+                ],
+                verified_by="execute_endpoint",
+            )
+        return await self._run_action(
+            config,
+            action,
+            data,
+            idempotency_key,
+            max_tokens=max_tokens,
+            include_meta=include_meta,
+            body=_build_request_body(encoding, files, binary, query),
+        )
+
+    async def _run_action(
+        self,
+        config: AdapterConfig,
+        action: ActionConfig,
+        data: dict[str, Any],
+        idempotency_key: str | None,
+        *,
+        max_tokens: int | None,
+        include_meta: bool | None,
+        body: RequestBody | None,
+    ) -> ActionResult:
         await self._ensure_rate_limit_seeded(config, action.endpoint_path)
 
         from liquid.action.executor import ActionExecutor
@@ -1906,6 +2034,7 @@ class Liquid:
                 retry_policy=self._retry_policy or WRITE_RETRY_DEFAULTS,
                 rate_limiter=self.rate_limiter,
                 adapter_id=config.config_id,
+                body_limits=self._body_limits,
             )
             result = await executor.execute(
                 action=action,
@@ -1913,6 +2042,7 @@ class Liquid:
                 schema=config.schema_,
                 auth_ref=config.auth_ref,
                 idempotency_key=idempotency_key,
+                body=body,
             )
 
         if self.normalize_output and result.response_body is not None:
@@ -2028,6 +2158,11 @@ class Liquid:
         action: str,
         data: dict[str, Any],
         idempotency_key: str | None = None,
+        *,
+        encoding: BodyEncoding | str | None = None,
+        files: Sequence[FilePart | dict[str, Any]] | None = None,
+        binary: FilePart | dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
     ) -> ActionResult:
         """Convenience: find action by 'METHOD /path' string and execute.
 
@@ -2052,7 +2187,16 @@ class Liquid:
             msg = f"Action '{action}' not found in adapter config"
             raise ValueError(msg)
 
-        return await self.execute(config, matched.action_id, data, idempotency_key)
+        return await self.execute(
+            config,
+            matched.action_id,
+            data,
+            idempotency_key,
+            encoding=encoding,
+            files=files,
+            binary=binary,
+            query=query,
+        )
 
     async def execute_batch(
         self,
@@ -2093,6 +2237,7 @@ class Liquid:
                 retry_policy=self._retry_policy or WRITE_RETRY_DEFAULTS,
                 rate_limiter=self.rate_limiter,
                 adapter_id=config.config_id,
+                body_limits=self._body_limits,
             )
             batch_executor = BatchExecutor(
                 executor=executor,
@@ -2263,6 +2408,23 @@ class Liquid:
                 json.dumps(target_model),
                 corrections,
             )
+
+
+def _build_request_body(
+    encoding: BodyEncoding | str | None,
+    files: Sequence[FilePart | dict[str, Any]] | None,
+    binary: FilePart | dict[str, Any] | None,
+    query: dict[str, Any] | None,
+) -> RequestBody | None:
+    """Assemble the optional non-JSON body options; ``None`` keeps the plain JSON path."""
+    if encoding is None and not files and binary is None and not query:
+        return None
+    return RequestBody(
+        encoding=BodyEncoding(encoding) if encoding is not None else None,
+        files=[f if isinstance(f, FilePart) else FilePart(**f) for f in files or []],
+        binary=binary if binary is None or isinstance(binary, FilePart) else FilePart(**binary),
+        query=query or {},
+    )
 
 
 def _repair_actions(

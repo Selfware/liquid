@@ -308,3 +308,53 @@ class TestSenseTool:
         sense = next(t for t in tools if t["name"] == "sense_events")
         props = sense["input_schema"]["properties"]
         assert {"cursor", "max_events", "max_seconds"} <= set(props)
+
+
+class TestBodyEncodingNote:
+    """Write tools tell the agent when an endpoint doesn't take a JSON body."""
+
+    @staticmethod
+    def _config(content_types):
+        from liquid.models.action import ActionConfig
+        from liquid.models.adapter import AdapterConfig, FieldMapping, SyncConfig
+        from liquid.models.schema import APISchema, AuthRequirement, Endpoint, EndpointKind
+
+        schema = APISchema(
+            source_url="https://api.example.com",
+            service_name="X",
+            discovery_method="openapi",
+            endpoints=[
+                Endpoint(
+                    path="/media",
+                    method="POST",
+                    description="Upload media",
+                    kind=EndpointKind.WRITE,
+                    request_content_types=content_types,
+                )
+            ],
+            auth=AuthRequirement(type="bearer", tier="A"),
+        )
+        return AdapterConfig(
+            schema=schema,
+            auth_ref="v",
+            mappings=[FieldMapping(source_path="a", target_field="b")],
+            sync=SyncConfig(endpoints=["/media"]),
+            actions=[ActionConfig(endpoint_path="/media", endpoint_method="POST", verified_by="admin")],
+        )
+
+    def test_multipart_endpoint_is_flagged(self):
+        tool = adapter_to_tools(self._config(["multipart/form-data"]), format="mcp")[0]
+        assert "multipart/form-data" in tool["description"]
+        assert "files=[...]" in tool["description"]
+
+    def test_binary_and_form_endpoints_are_flagged(self):
+        assert "binary={...}" in adapter_to_tools(self._config(["audio/wav"]), format="mcp")[0]["description"]
+        assert (
+            "encoding='form'"
+            in adapter_to_tools(self._config(["application/x-www-form-urlencoded"]), format="mcp")[0]["description"]
+        )
+
+    def test_json_endpoints_are_unchanged(self):
+        for types in ([], ["application/json"]):
+            tool = adapter_to_tools(self._config(types), format="mcp")[0]
+            assert tool["description"] == "Upload media"
