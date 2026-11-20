@@ -97,6 +97,7 @@ def adapter_to_tools(
             description = _build_agent_description(endpoint, config)
         else:
             description = endpoint.description or f"{endpoint.method} {endpoint.path}"
+        description += _body_encoding_note(endpoint)
         tool = {
             "name": name,
             "description": description,
@@ -132,6 +133,20 @@ def adapter_to_tools(
 
     # Format for target
     return [_format_tool(t, format) for t in tools]
+
+
+def _body_encoding_note(endpoint: Endpoint) -> str:
+    """A description suffix telling the agent a write endpoint doesn't take a plain JSON body."""
+    encoding = endpoint.preferred_body_encoding()
+    if encoding is None or encoding.value == "json":
+        return ""
+    declared = ", ".join(endpoint.request_content_types)
+    hint = {
+        "form": "send the fields as a form (encoding='form')",
+        "multipart": "send the fields plus files as a multipart upload (encoding='multipart', files=[...])",
+        "binary": "send the file as the raw request body (encoding='binary', binary={...})",
+    }[encoding.value]
+    return f" [Request body: {declared} — {hint}.]"
 
 
 def _derive_tool_name(method: str, path: str) -> str:

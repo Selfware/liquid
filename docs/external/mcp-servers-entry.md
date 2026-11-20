@@ -24,6 +24,7 @@ uvx liquid-mcp                      # or: pip install liquid-api && liquid-mcp
 - `liquid_discover` — inspect an interface without saving an adapter
 - `liquid_list_adapters` — list connected adapters
 - `liquid_execute` — write (database insert/update/delete) — **only when started with `LIQUID_ALLOW_WRITES=1`**; the default surface is read-only
+- `liquid_request` — write a form, multipart file upload or raw binary body to an HTTP API (files only from `LIQUID_FILE_ROOTS`, capped by `LIQUID_MAX_BODY_BYTES`) — **only when started with `LIQUID_ALLOW_WRITES=1`**
 
 **Repository:** https://github.com/ertad-family/liquid
 **License:** AGPL-3.0

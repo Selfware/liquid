@@ -70,7 +70,7 @@
     "allow_writes": {
       "type": "boolean",
       "title": "Allow database writes",
-      "description": "Expose the liquid_execute tool so the agent can INSERT / UPDATE / DELETE in connected databases. Off by default — the surface is read-only.",
+      "description": "Expose the write tools: liquid_execute (INSERT / UPDATE / DELETE in connected databases) and liquid_request (form, multipart file-upload and raw binary bodies to HTTP APIs). Off by default — the surface is read-only.",
       "default": false
     }
   },

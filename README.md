@@ -275,8 +275,10 @@ Tools: `liquid_connect` (discover + map any interface), `liquid_fetch`,
 `liquid_query` (server-side search/aggregate), `liquid_estimate` (pre-flight
 cost/size, no call), `liquid_list_adapters`, `liquid_discover`. The surface is
 **read-only by default**; start the server with `LIQUID_ALLOW_WRITES=1` to also
-expose `liquid_execute` (database insert/update/delete). Adapters and credentials
-persist under `~/.liquid`. Backed by **any LLM** — OpenAI, Gemini, Anthropic, any
+expose `liquid_execute` (database insert/update/delete) and `liquid_request` (form,
+multipart file upload and raw binary bodies; files only from `LIQUID_FILE_ROOTS`,
+default `~/.liquid/uploads`, capped by `LIQUID_MAX_BODY_BYTES`, default 25 MiB).
+Adapters and credentials persist under `~/.liquid`. Backed by **any LLM** — OpenAI, Gemini, Anthropic, any
 OpenAI-compatible/local endpoint via `base_url`, **100+ providers via LiteLLM**,
 or your own function through `CallableBackend`.
 
@@ -322,7 +324,7 @@ pluggable transport driver runs it — but the agent-facing API (`fetch`, `query
 
 | Interface | Runtime | Write | Install |
 |---|---|---|---|
-| REST / HTTP+JSON | ✅ | ✅ actions (POST/PUT/PATCH/DELETE) | — |
+| REST / HTTP+JSON | ✅ | ✅ actions (POST/PUT/PATCH/DELETE) — JSON, form, multipart file upload, raw binary | — |
 | GraphQL | ✅ query + Relay pagination | ✅ mutations | — |
 | SOAP / WSDL | ✅ stdlib XML | — | — |
 | gRPC | ✅ unary + server-streaming (reflection) | — | `liquid-api[grpc]` |
@@ -352,6 +354,30 @@ insert/update/delete, Redis `SET`/`HSET`/`DEL`, Neo4j node CRUD); web/agent
 writes go through verified actions. Identifiers come from introspection and
 values are parameterized; `update`/`delete` require a `where` (no blanket
 mutations); writes are **off until you opt in** with `allow_write=True`.
+
+**Forms, file uploads and raw binary bodies.** A write isn't always JSON. The same
+`execute` / `execute_endpoint` call sends all four encodings, and discovery records
+which one an endpoint expects (`Endpoint.request_content_types`, from the OpenAPI
+`requestBody` / Swagger `consumes`) so the right one is picked automatically:
+
+```python
+# 1. Form (application/x-www-form-urlencoded) — SMS APIs, OAuth token calls …
+await liquid.execute_endpoint(sms, "/Messages.json", {"To": "+15551234567", "Body": "hi"},
+                              allow_write=True, encoding="form")
+
+# 2. Multipart file upload (multipart/form-data) — plain fields + files, from a path, bytes or base64
+await liquid.execute_endpoint(cms, "/media", {"title": "Cover"}, allow_write=True,
+                              files=[{"field": "file", "path": "cover.jpg"}])
+
+# 3. Raw binary body (audio/*, application/octet-stream) — the file *is* the body
+await liquid.execute_endpoint(speech, "/v1/listen", allow_write=True,
+                              binary={"path": "call.wav", "content_type": "audio/wav"},
+                              query={"model": "nova-2"})
+```
+
+Bodies are capped (25 MiB by default, `Liquid(max_body_bytes=…)`), file paths can be
+confined to allowed roots (`Liquid(file_roots=[…])` — always on in the MCP server),
+and file contents are never logged. See [docs/REQUEST_BODIES.md](docs/REQUEST_BODIES.md).
 
 **Sense — the afferent organ.** `liquid.sense(adapter, endpoint)` perceives a live
 event stream wherever one exists: SQL row deltas (and Postgres `LISTEN/NOTIFY`),
@@ -484,3 +510,4 @@ of the box.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Extending](docs/EXTENDING.md) — implement your own Vault / LLM / Sink
 - [Write operations spec](docs/SPEC-WRITE-OPERATIONS.md)
+- [Forms, file uploads and raw binary bodies](docs/REQUEST_BODIES.md)

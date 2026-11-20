@@ -284,7 +284,7 @@ async def test_robots_blocks_disallowed_grid():
         "detail": False,
         "fields": {"title": {"selector": "a.ttl", "scope": "row"}},
     }
-    with pytest.raises(AuthError, match="robots.txt"):
+    with pytest.raises(AuthError, match=r"robots\.txt"):
         await _run(handler, _endpoint(meta))
 
 
