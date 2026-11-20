@@ -23,7 +23,9 @@ dependencies = [
     # The bundled MCP server (`liquid-mcp` console script) is a first-class
     # feature, so `mcp` is a core dep — `liquid-mcp` works after a plain install
     # and `uv sync` (no extra needed). Avoids a ModuleNotFoundError footgun.
-    "mcp>=1.0",
+    # Capped below 2: mcp 2.x renamed the Tool/ToolAnnotations attributes and changed the
+    # client/notification API this package builds on, so it is not supported yet.
+    "mcp>=1.0,<2",
     # FileVault encrypts credentials at rest (Fernet). A security primitive for the
     # default credential store is core, not optional — unlike provider SDKs.
     "cryptography>=42",
@@ -126,6 +128,9 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.11",
     "pre-commit>=4.0",
+    # The HTML-grid scrape driver's tests import these (the `scrape` extra).
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
     # In-process MQTT broker for the live MQTT round-trip test (self-skips if absent).
     "amqtt>=0.11",
 ]
